@@ -236,6 +236,109 @@ def _is_headless_replay(digest: "SessionDigest") -> bool:
     return False
 
 
+# ── Issue #319: single-turn transcripts a local hook re-runs verbatim ──
+
+# A hook that summarises the previous session on a timer (for example every
+# hour) writes one single-turn transcript per run: a machine-written prompt
+# and one answer. The prompt is the hook's own template, so its leading text
+# is identical in every run while the payload it embeds differs. Neither
+# `_is_headless_replay` nor `_is_agent_session` matches those templates — they
+# are another tool's, not the engine's or a known sub-agent's — and in the
+# Claude Code desktop app the headless runs carry entrypoint
+# "claude-desktop", like interactive ones, so `entrypoint` cannot separate
+# them either. They arrive at a fixed cadence, so they used to fill
+# `--max-sessions` (harvest walks newest first and stops at the cap) and push
+# real interactive sessions out of the night entirely.
+#
+# The signal available to a tool that cannot know another tool's templates is
+# recurrence: one prompt prefix shared by several single-turn sessions of the
+# same harvest window. Real one-shot prompts repeat verbatim too, so a
+# candidate must additionally be long enough that the shared prefix is
+# boilerplate — a machine template carries the run's own payload past it.
+_REPEAT_PREFIX_CHARS = 120
+
+# Sessions that must share a prompt prefix before it counts as a template.
+_DEFAULT_REPEAT_MIN_SESSIONS = 3
+
+
+def _repeat_min_sessions() -> int:
+    """How many sessions a prompt prefix must recur in (Issue #319).
+
+    ``SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS`` overrides the default of
+    ``_DEFAULT_REPEAT_MIN_SESSIONS``; ``0`` disables the filter, which is the
+    escape hatch for a project whose own one-shot prompts are long and
+    identical. Read per call so a long-running process — and the tests — can
+    change it without reloading the module.
+    """
+    raw = os.environ.get("SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS", "").strip()
+    if not raw:
+        return _DEFAULT_REPEAT_MIN_SESSIONS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        import logging
+        logging.getLogger("skillopt_sleep").warning(
+            "ignoring non-integer SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS=%r", raw
+        )
+        return _DEFAULT_REPEAT_MIN_SESSIONS
+
+
+def _repeat_prefix(digest: "SessionDigest") -> str:
+    """Normalized leading text of a single-turn session, or "" if ineligible.
+
+    Multi-turn sessions are interactive by definition, and a prompt shorter
+    than ``_REPEAT_PREFIX_CHARS`` is dropped because then the *whole* prompt
+    would have to repeat — the shape of a real recurring one-liner, not of a
+    template with a fresh payload appended.
+    """
+    if digest.n_user_turns != 1:
+        return ""
+    prompt = (digest.user_prompts[0] if digest.user_prompts else "").strip()
+    if len(prompt) < _REPEAT_PREFIX_CHARS:
+        return ""
+    # Case and whitespace are uninteresting here: a template re-rendered with
+    # different line wrapping is still the same template.
+    return " ".join(prompt[:_REPEAT_PREFIX_CHARS].lower().split())
+
+
+def _machine_generated_repeats(
+    digests: List["SessionDigest"], min_sessions: int
+) -> set:
+    """Session ids whose prompt prefix recurs across `min_sessions` sessions."""
+    if min_sessions <= 0:
+        return set()
+    groups: Dict[str, List[str]] = {}
+    for d in digests:
+        key = _repeat_prefix(d)
+        if key:
+            groups.setdefault(key, []).append(d.session_id)
+    repeated: set = set()
+    for ids in groups.values():
+        if len(ids) >= min_sessions:
+            repeated.update(ids)
+    return repeated
+
+
+def format_harvest_note(stats: Optional[Dict[str, int]]) -> str:
+    """One-line suffix describing what ``harvest()`` filtered out (#319).
+
+    Empty when there is nothing worth reporting, so callers can append it
+    unconditionally.
+    """
+    if not stats:
+        return ""
+    parts: List[str] = []
+    repeats = int(stats.get("machine_generated_repeats", 0) or 0)
+    if repeats:
+        parts.append(f"{repeats} machine-generated")
+    over_cap = int(stats.get("skipped_by_cap", 0) or 0)
+    if over_cap:
+        parts.append(f"{over_cap} past the session cap")
+    if not parts:
+        return ""
+    return f" (skipped: {', '.join(parts)})"
+
+
 def digest_transcript(path: str) -> Optional[SessionDigest]:
     """Build a SessionDigest from one ``<sessionId>.jsonl`` transcript."""
     session_id = os.path.splitext(os.path.basename(path))[0]
@@ -385,6 +488,7 @@ def harvest(
     invoked_project: str = "",
     since_iso: Optional[str] = None,
     limit: int = 0,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[SessionDigest]:
     """Walk ~/.claude/projects and return digests matching scope/time.
 
@@ -395,6 +499,17 @@ def harvest(
     invoked_project : str    used when scope == "invoked"
     since_iso : str|None      ISO8601; only sessions ending after this are kept
     limit : int               cap number of digests (0 = no cap)
+    stats : dict|None         filled in place with what was filtered out:
+                              ``candidates`` (in scope and in window),
+                              ``machine_generated_repeats`` (dropped as a
+                              re-run template, see `_machine_generated_repeats`),
+                              ``skipped_by_cap`` (in scope, but past `limit`),
+                              and ``sessions`` (returned). Callers use
+                              `format_harvest_note` to report them.
+
+    The window is scanned in full before `limit` is applied: a repeated
+    template can only be recognized by comparing it with the rest of the
+    window, and it must not be counted against the cap it used to fill.
     """
     digests: List[SessionDigest] = []
     if not os.path.isdir(transcripts_dir):
@@ -412,6 +527,7 @@ def harvest(
     # newest first by mtime
     paths.sort(key=_safe_mtime, reverse=True)
 
+    candidates: List[SessionDigest] = []
     for p in paths:
         d = digest_transcript(p)
         if d is None:
@@ -427,7 +543,20 @@ def harvest(
             # ended_at timestamp — mtime can diverge (copy/touch), so we
             # cannot break here; we must continue to check all files.
             continue
-        digests.append(d)
-        if limit and len(digests) >= limit:
-            break
+        candidates.append(d)
+
+    # Issue #319: a local hook's single-turn summary sessions arrive hourly.
+    # They are transcript noise, not the user's tasks, so drop them before the
+    # cap rather than letting them consume it.
+    repeated = _machine_generated_repeats(candidates, _repeat_min_sessions())
+    kept = [d for d in candidates if d.session_id not in repeated]
+    digests = kept[:limit] if limit else kept
+
+    if stats is not None:
+        stats.update(
+            candidates=len(candidates),
+            machine_generated_repeats=len(repeated),
+            skipped_by_cap=len(kept) - len(digests),
+            sessions=len(digests),
+        )
     return digests

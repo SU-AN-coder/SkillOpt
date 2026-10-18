@@ -96,6 +96,40 @@ session data and provider policy before using a real backend on a sensitive
 project; the [shared integration guide](../README.md#data-boundary) describes a
 reviewed task-file workflow.
 
+### Sessions you did not type
+
+Harvest keeps your prompts and drops machine-written transcripts. Three
+environment variables extend what counts as machine-written, for the sessions
+Claude Code gives no other tell:
+
+| Variable | Effect |
+|---|---|
+| `SKILLOPT_SLEEP_AGENT_MARKERS` | Comma-separated markers; a session whose **first** prompt contains one is dropped entire. |
+| `SKILLOPT_SLEEP_NEG_FEEDBACK` / `SKILLOPT_SLEEP_POS_FEEDBACK` | Extra comma-separated phrases, in any language, that count as you rejecting or approving the previous answer. |
+
+The case they exist for is a local hook that summarises the previous session on
+a timer. Its runs are single-turn, they are frequent enough to fill
+`--max-sessions` and starve the night of your real sessions, and in the desktop
+app they carry `entrypoint: "claude-desktop"` like interactive ones — so neither
+`entrypoint` nor a replay marker identifies them. Quote the hook's first line:
+
+```bash
+export SKILLOPT_SLEEP_AGENT_MARKERS="Below is a conversation log from a coding session"
+```
+
+A template you cannot quote is covered without configuration: a single-turn
+session sharing its first 120 characters of prompt with three others in the same
+harvest window is a hook re-running one job, and it is dropped before the
+session cap is applied. Tune that with `SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS`
+(default `3`, `0` disables). A session with a follow-up user turn is never
+matched, and neither is a prompt shorter than the prefix — your own one-shot
+requests repeat entirely rather than sharing a long boilerplate header.
+
+`/skillopt-sleep harvest` and the progress line of a `run` / `dry-run` report
+what was dropped, so a thin night is explainable:
+`harvest done: sessions=120 (skipped: 297 machine-generated, 2 past the session cap)`.
+Full reference: [the sleep guide](../../docs/sleep/README.md#harvest-filters-environment).
+
 ### Handoff mode (session answers the model calls)
 
 `--backend handoff` runs the cycle without any model subprocess: the engine
