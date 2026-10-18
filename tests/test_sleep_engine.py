@@ -82,6 +82,128 @@ class TestHarvest(unittest.TestCase):
         self.assertTrue(_is_meta_prompt("<system-reminder>x</system-reminder>"))
         self.assertFalse(_is_meta_prompt("please refactor the auth module"))
 
+    def _write_claude_session(self, path, turns):
+        """Write one Claude Code transcript; ``turns`` are (role, text) pairs.
+
+        Records are an hour apart so the sub-3-second heuristic in
+        _is_headless_replay never decides these fixtures.
+        """
+        self._write_jsonl(path, [
+            {"type": role,
+             "timestamp": f"2026-10-15T0{index + 1}:00:00Z",
+             "cwd": "/repo/example",
+             "sessionId": os.path.splitext(os.path.basename(path))[0],
+             "message": {"role": role, "content": text}}
+            for index, (role, text) in enumerate(turns)
+        ])
+
+    def test_meta_prompt_keeps_pasted_user_content(self):
+        # issue #318: the desktop app delivers a pasted brief inside a tag
+        # pair carrying the same id. The user typed that brief, so it is user
+        # content, and dropping it left the session's follow-up as the intent.
+        from skillopt_sleep.harvest import _strip_host_wrappers
+
+        brief = ('<pasted_content id="a1b2">\n'
+                 'Install tool X into a dedicated folder, pin the version.\n'
+                 '</pasted_content id="a1b2">')
+
+        self.assertFalse(_is_meta_prompt(brief))
+        # the helper removes the tags only; callers strip the remainder
+        self.assertEqual(
+            _strip_host_wrappers(brief),
+            "\nInstall tool X into a dedicated folder, pin the version.\n",
+        )
+
+    def test_meta_prompt_filters_only_known_host_tags(self):
+        self.assertTrue(_is_meta_prompt("<local-command-stdout>ok</local-command-stdout>"))
+        self.assertTrue(_is_meta_prompt(
+            "<command-message>skillopt-sleep</command-message>\n"
+            "<command-name>/skillopt-sleep</command-name>"
+        ))
+        # VS Code Copilot Chat brackets each request's machine context the
+        # same way; it is host detail, not a prompt, and must stay out
+        # (tests/test_copilot_harvest.py pins the privacy boundary).
+        self.assertTrue(_is_meta_prompt(
+            "<environment_info>private machine context</environment_info>"
+        ))
+        # A wrapper the host does not own is user text, not noise: it must
+        # survive the filter with its content instead of being dropped for
+        # being wrapped in angle brackets, which is what lost pasted briefs.
+        self.assertFalse(_is_meta_prompt("<release-notes>Ship 1.4</release-notes>"))
+
+    def test_pasted_brief_becomes_the_mined_intent(self):
+        brief = ('<pasted_content id="a1b2">\n'
+                 'Install tool X into a dedicated folder, pin the version, '
+                 'back up the configs first.\n'
+                 '</pasted_content id="a1b2">')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pasted-session.jsonl")
+            self._write_claude_session(path, [
+                ("user", brief),
+                ("assistant", "Plan: ..."),
+                ("user", "Yes, go ahead with option A."),
+                ("assistant", "Done."),
+            ])
+            digest = digest_transcript(path)
+
+        [task] = heuristic_mine([digest])
+        self.assertEqual(
+            task.intent,
+            "Install tool X into a dedicated folder, pin the version, back up the configs first.",
+        )
+        self.assertNotIn("pasted_content", task.intent)
+        # the follow-up stays available as constraint context, not as intent
+        self.assertIn("Yes, go ahead with option A.", task.context_excerpt)
+
+    def test_session_whose_only_user_turn_is_a_pasted_brief_survives_harvest(self):
+        from skillopt_sleep.harvest import harvest
+
+        brief = ('<pasted_content id="a1b2">\nInstall tool X into a dedicated folder.\n'
+                 '</pasted_content id="a1b2">')
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = os.path.join(tmp, "projects", "-repo-example")
+            os.makedirs(project_dir)
+            self._write_claude_session(os.path.join(project_dir, "pasted-only.jsonl"), [
+                ("user", brief),
+                ("assistant", "Plan: ..."),
+                ("assistant", "Done."),
+            ])
+
+            digests = harvest(os.path.join(tmp, "projects"), scope="all")
+
+        self.assertEqual([d.session_id for d in digests], ["pasted-only"])
+        self.assertEqual(digests[0].user_prompts,
+                         ["Install tool X into a dedicated folder."])
+
+    def test_system_reminder_prefix_does_not_ride_into_the_intent(self):
+        request = "Yes: run the third review on range r2..abc1234 and update the report."
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "reminder-prefix.jsonl")
+            self._write_claude_session(path, [
+                ("user", "<system-reminder>\nStatus note injected by the host app.\n"
+                         f"</system-reminder>\n\n{request}"),
+                ("assistant", "Running the review."),
+            ])
+            digest = digest_transcript(path)
+
+        self.assertEqual(digest.user_prompts, [request])
+        [task] = heuristic_mine([digest])
+        self.assertEqual(task.intent, request)
+        self.assertNotIn("Status note", task.intent)
+
+    def test_session_without_user_turns_is_a_replay_only_when_it_has_no_work(self):
+        from skillopt_sleep.harvest import _is_headless_replay
+
+        # issue #318: all user turns filtered out is not a replay signal on
+        # its own — real assistant work means the session is a real one.
+        worked = SessionDigest(session_id="s", project="/repo/example",
+                               assistant_finals=["Done."],
+                               n_user_turns=0, n_assistant_turns=2)
+        empty = SessionDigest(session_id="s", project="/repo/example")
+
+        self.assertFalse(_is_headless_replay(worked))
+        self.assertTrue(_is_headless_replay(empty))
+
     def _claude_session_with_injected_messages(self, tmp, follow_up):
         """A Claude Code session as written to disk when a skill is loaded.
 
