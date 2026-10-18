@@ -337,7 +337,9 @@ adopt, or advance state. Use another backend for those tasks.
 The initial harvest window is 72 hours. Set `--lookback-hours N` explicitly when
 older sessions should be considered; `0` scans all history subject to the
 session limit. A stateful `run`, even with no mined tasks, advances the harvest
-checkpoint. Use `harvest` or `dry-run` to inspect counts first. A real-backend
+checkpoint for that project and transcript source — each source keeps its own
+window, so a run of one source never hides another source's sessions. Use
+`harvest` or `dry-run` to inspect counts first. A real-backend
 `dry-run` still incurs provider calls and spend, and session/task limits are not
 hard call, token, time, or monetary budgets.
 
