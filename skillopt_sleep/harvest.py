@@ -143,11 +143,12 @@ def _detect_feedback(text: str) -> List[str]:
 # session, so the wrapper is unwrapped instead of dropped.
 _PASTED_CONTENT_RE = re.compile(r"</?pasted_content[^>]*>", re.IGNORECASE)
 
-# Host-injected status notes and environment blocks. A message that is only
-# a reminder is host noise, and a reminder prefixed to a real request must
-# not ride into the mined intent as text the user never wrote.
+# Host-injected status notes. A message that is only a reminder is host noise,
+# and a reminder *prefixed* to a real request must not ride into the mined
+# intent as text the user never wrote. The match is anchored by the caller:
+# only the block that leads a message is removed.
 _SYSTEM_REMINDER_RE = re.compile(
-    r"<system-reminder>.*?</system-reminder>\s*", re.IGNORECASE | re.DOTALL
+    r"<system-reminder\b[^>]*>.*?</system-reminder\s*>", re.IGNORECASE | re.DOTALL
 )
 
 # Tags the host injects as a whole user message: expanded slash-command
@@ -170,14 +171,25 @@ _HOST_META_TAGS = (
 
 
 def _strip_host_wrappers(text: str) -> str:
-    """Unwrap pasted user content and drop host-injected blocks.
+    """Unwrap pasted user content and drop the host's own leading notes.
 
-    Only the two wrappers above are touched: a message keeps its text when it
-    is wrapped in a tag the host does not own.
+    ``<pasted_content>`` tags only ever wrap text the user typed, so both the
+    opening and the closing tag are removed wherever they appear. A
+    ``<system-reminder>`` block is removed only while it *leads* the message,
+    which is how the host prepends it. The same text inside a prompt the user
+    wrote — an inline-code sample, a fenced XML example — is their content and
+    survives, so the harvested request stays what they typed.
     """
     if "<" not in text:
         return text
-    return _PASTED_CONTENT_RE.sub("", _SYSTEM_REMINDER_RE.sub("", text))
+    out = _PASTED_CONTENT_RE.sub("", text)
+    while True:
+        stripped = out.lstrip()
+        match = _SYSTEM_REMINDER_RE.match(stripped)
+        if match is None:
+            break
+        out = stripped[match.end():]
+    return out
 
 
 def _is_meta_prompt(text: str) -> bool:
@@ -267,11 +279,12 @@ def _is_headless_replay(digest: "SessionDigest") -> bool:
     if digest.n_user_turns > 1:
         return False
     if digest.n_user_turns == 0:
-        # Every user turn was filtered as host noise or engine input. That is
-        # not a replay signal by itself: a session whose user turns were all
-        # host-wrapped still holds real assistant work (#318), so only a
-        # transcript with no work at all counts as engine-generated.
-        return digest.n_assistant_turns == 0
+        # Every user turn was filtered as host noise or engine input, so there
+        # is no user intent to mine. Such a record must not be admitted: it
+        # would take a slot under --max-sessions and yield no task, displacing
+        # a real session (review of #318). A pasted brief is not this case —
+        # it now survives the filter as a user turn.
+        return True
     prompt = digest.user_prompts[0] if digest.user_prompts else ""
     for marker in _REPLAY_PROMPT_MARKERS:
         if marker in prompt:

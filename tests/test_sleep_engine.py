@@ -191,18 +191,66 @@ class TestHarvest(unittest.TestCase):
         self.assertEqual(task.intent, request)
         self.assertNotIn("Status note", task.intent)
 
-    def test_session_without_user_turns_is_a_replay_only_when_it_has_no_work(self):
-        from skillopt_sleep.harvest import _is_headless_replay
+    def test_host_only_transcript_does_not_take_a_session_slot(self):
+        from skillopt_sleep.harvest import harvest
 
-        # issue #318: all user turns filtered out is not a replay signal on
-        # its own — real assistant work means the session is a real one.
-        worked = SessionDigest(session_id="s", project="/repo/example",
-                               assistant_finals=["Done."],
-                               n_user_turns=0, n_assistant_turns=2)
-        empty = SessionDigest(session_id="s", project="/repo/example")
+        # Review of #318: a record with no user intent must not be admitted
+        # before the cap. It mines nothing, so admitting it turns a night into
+        # zero tasks by displacing a real session with a newer host-only one.
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = os.path.join(tmp, "projects", "-repo-example")
+            os.makedirs(project_dir)
+            host_only = os.path.join(project_dir, "host-note.jsonl")
+            self._write_jsonl(host_only, [
+                {"type": "user", "isMeta": True,
+                 "timestamp": "2026-10-15T09:00:00Z",
+                 "cwd": "/repo/example", "sessionId": "host-note",
+                 "message": {"role": "user",
+                             "content": "<local-command-stdout>ok</local-command-stdout>"}},
+                {"type": "assistant", "timestamp": "2026-10-15T09:00:30Z",
+                 "cwd": "/repo/example", "sessionId": "host-note",
+                 "message": {"role": "assistant", "content": "Noted."}},
+            ])
+            real = os.path.join(project_dir, "real-task.jsonl")
+            self._write_claude_session(real, [
+                ("user", "Fix the failing date parser test in module B."),
+                ("assistant", "Fixed."),
+            ])
+            os.utime(host_only, (2_000_000, 2_000_000))   # newer
+            os.utime(real, (1_000_000, 1_000_000))
 
-        self.assertFalse(_is_headless_replay(worked))
-        self.assertTrue(_is_headless_replay(empty))
+            digests = harvest(os.path.join(tmp, "projects"), scope="all", limit=1)
+
+        self.assertEqual([d.session_id for d in digests], ["real-task"])
+
+    def test_inline_code_system_reminder_example_is_user_text(self):
+        # Review of #318: the user quoting a reminder inside inline code was
+        # being deleted, which changed both the request and the mined intent.
+        request = ("How should I escape `<system-reminder>note</system-reminder>` "
+                   "inside my transcript fixture?")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "inline-example.jsonl")
+            self._write_claude_session(path, [
+                ("user", request),
+                ("assistant", "Use html.escape()."),
+            ])
+            digest = digest_transcript(path)
+
+        self.assertEqual(digest.user_prompts, [request])
+
+    def test_fenced_system_reminder_example_is_user_text(self):
+        request = ("This is what our host writes before a real request:\n"
+                   "```xml\n<system-reminder>\ncontext\n</system-reminder>\n```\n"
+                   "Please make the parser strip it.")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "fenced-example.jsonl")
+            self._write_claude_session(path, [
+                ("user", request),
+                ("assistant", "Will do."),
+            ])
+            digest = digest_transcript(path)
+
+        self.assertEqual(digest.user_prompts, [request])
 
     def _claude_session_with_injected_messages(self, tmp, follow_up):
         """A Claude Code session as written to disk when a skill is loaded.
