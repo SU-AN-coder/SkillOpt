@@ -117,17 +117,20 @@ app they carry `entrypoint: "claude-desktop"` like interactive ones — so neith
 export SKILLOPT_SLEEP_AGENT_MARKERS="Below is a conversation log from a coding session"
 ```
 
-A template you cannot quote is covered without configuration: a single-turn
+A template you cannot quote is covered only after you opt in: a single-turn
 session sharing its first 120 characters of prompt with three others in the same
-harvest window is a hook re-running one job, and it is dropped before the
-session cap is applied. Tune that with `SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS`
-(default `3`, `0` disables). A session with a follow-up user turn is never
-matched, and neither is a prompt shorter than the prefix — your own one-shot
-requests repeat entirely rather than sharing a long boilerplate header.
+harvest window is dropped before the session cap is applied once
+`SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS` is set (default `0`, off; `3` is the usual
+choice). Recurrence is not proof of who wrote a prompt — three human requests
+against one long shared checklist look the same — so the default keeps every
+session and `--max-sessions` still bounds how many transcripts are read. A
+session with a follow-up user turn is never matched, and neither is a prompt
+shorter than the prefix — your own one-shot requests repeat entirely rather than
+sharing a long boilerplate header.
 
 `/skillopt-sleep harvest` and the progress line of a `run` / `dry-run` report
 what was dropped, so a thin night is explainable:
-`harvest done: sessions=120 (skipped: 297 machine-generated, 2 past the session cap)`.
+`harvest done: sessions=120 (skipped: 297 repeated-template sessions, 2 past the session cap)`.
 Full reference: [the sleep guide](../../docs/sleep/README.md#harvest-filters-environment).
 
 ### Handoff mode (session answers the model calls)

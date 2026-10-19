@@ -213,7 +213,7 @@ the night:
 | `SKILLOPT_SLEEP_AGENT_MARKERS` | Comma-separated markers. A session whose **first** user prompt contains one is dropped entire — for prompts written by another tool's sub-agent (memory observers, critic agents, hook-driven runs). |
 | `SKILLOPT_SLEEP_NEG_FEEDBACK` | Extra comma-separated phrases, in any language, that count as you disapproving of the previous answer. |
 | `SKILLOPT_SLEEP_POS_FEEDBACK` | The same, for approval. |
-| `SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS` | Sessions a prompt prefix must recur in before the repeats are treated as a hook re-running itself (default `3`; `0` turns the filter off). |
+| `SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS` | Sessions a prompt prefix must recur in before the repeats are treated as one template (default `0`: off; `3` is the usual opt-in, `0` turns a configured value back off). |
 
 The first three cover a tool whose prompt template you can quote, and the
 filter they feed is exact: it checks the session's first user prompt against
@@ -226,21 +226,30 @@ they exist for:
 export SKILLOPT_SLEEP_AGENT_MARKERS="Below is a conversation log from a coding session"
 ```
 
-`SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS` covers the templates you cannot quote. A
-single-turn session that shares its first 120 characters of prompt with
-`N` others in the same harvest window is a hook re-running one job; the filter
-drops those repeats *before* `--max-sessions` is applied, so they cannot
-consume the cap the way they did in #319. A session with a follow-up user turn
-is never matched (it is interactive by definition), and neither is a prompt
-shorter than the prefix — a real one-shot request repeats entirely rather than
-sharing a long boilerplate header.
+`SKILLOPT_SLEEP_REPEAT_MIN_SESSIONS` covers the templates you cannot quote, but
+recurrence is not proof of who wrote a prompt, so it is **off by default**. A
+single-turn session that shares its first 120 characters of prompt with `N`
+others in the same harvest window is dropped *before* `--max-sessions` is
+applied, so the repeats cannot consume the cap the way they did in #319 — but
+only once you opt in with a value for `N` (3 is the usual choice). The reason
+for the default: three people asking for a code review against one long shared
+checklist are structurally identical to a hook re-running itself — one turn, one
+long common prefix, a different task after it — and losing a real task is worse
+than harvesting a hook's summary sessions. Set the variable for a project whose
+recurring sessions you have recognized. A session with a follow-up user turn is
+never matched (it is interactive by definition), and neither is a prompt shorter
+than the prefix — a real one-shot request repeats entirely rather than sharing a
+long boilerplate header.
 
 `harvest` and the progress output of `run` / `dry-run` report what was dropped,
 so a night that looks empty is explainable:
 
 ```text
-[sleep] 120 sessions -> 40 tasks (skipped: 297 machine-generated, 2 past the session cap)
+[sleep] 120 sessions -> 40 tasks (skipped: 297 repeated-template sessions, 2 past the session cap)
 ```
+
+With the filter off (the default) nothing is dropped by it, `--max-sessions`
+still bounds how many transcripts are read, and the note reports only the cap.
 
 ### VS Code GitHub Copilot Chat
 
