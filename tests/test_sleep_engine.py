@@ -114,6 +114,35 @@ class TestHarvest(unittest.TestCase):
             "\nInstall tool X into a dedicated folder, pin the version.\n",
         )
 
+    def test_literal_pasted_content_in_a_request_is_user_text(self):
+        # #321 review: the wrapper is the host's only while it leads the
+        # message. A request that names the tag pair literally — inline code,
+        # a fenced XML example, a fixture carrying attributes — keeps it, in
+        # the harvested request and in the mined intent alike.
+        from skillopt_sleep.harvest import _strip_host_wrappers
+
+        inline = ("Add a parser test for the literal inline example "
+                  "`<pasted_content>LITERAL_XML_VALUE</pasted_content>`.")
+        fenced = ("Add a parser test for this fenced example:\n\n```xml\n"
+                  "<pasted_content>LITERAL_XML_VALUE</pasted_content>\n```")
+        attributed = ('Keep `<pasted_content id="a1b2">LITERAL_XML_VALUE'
+                      '</pasted_content id="a1b2">` in the fixture.')
+        for text in (inline, fenced, attributed):
+            self.assertEqual(_strip_host_wrappers(text), text)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "literal-session.jsonl")
+            self._write_claude_session(path, [
+                ("user", inline),
+                ("assistant", "Plan: ..."),
+                ("user", "Yes, go ahead."),
+                ("assistant", "Done."),
+            ])
+            digest = digest_transcript(path)
+
+        [task] = heuristic_mine([digest])
+        self.assertIn("<pasted_content>LITERAL_XML_VALUE</pasted_content>", task.intent)
+
     def test_meta_prompt_filters_only_known_host_tags(self):
         self.assertTrue(_is_meta_prompt("<local-command-stdout>ok</local-command-stdout>"))
         self.assertTrue(_is_meta_prompt(

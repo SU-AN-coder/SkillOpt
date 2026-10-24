@@ -140,8 +140,13 @@ def _detect_feedback(text: str) -> List[str]:
 # The Claude Code desktop app delivers a pasted block as the user message,
 # wrapped in ``<pasted_content id="…">…</pasted_content id="…">``. The brief
 # the user pasted is typed by them and is often the whole point of the
-# session, so the wrapper is unwrapped instead of dropped.
-_PASTED_CONTENT_RE = re.compile(r"</?pasted_content[^>]*>", re.IGNORECASE)
+# session, so the wrapper is unwrapped instead of dropped — but only while it
+# leads the message, because the same tag pair inside a prompt the user wrote
+# is their content (#321 review: four literal-example cases).
+_PASTED_CONTENT_LEAD_RE = re.compile(
+    r"<pasted_content\b[^>]*>(.*?)</pasted_content[^>]*>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # Host-injected status notes. A message that is only a reminder is host noise,
 # and a reminder *prefixed* to a real request must not ride into the mined
@@ -171,25 +176,31 @@ _HOST_META_TAGS = (
 
 
 def _strip_host_wrappers(text: str) -> str:
-    """Unwrap pasted user content and drop the host's own leading notes.
+    """Unwrap a host's leading pasted block and drop its own leading notes.
 
-    ``<pasted_content>`` tags only ever wrap text the user typed, so both the
-    opening and the closing tag are removed wherever they appear. A
-    ``<system-reminder>`` block is removed only while it *leads* the message,
-    which is how the host prepends it. The same text inside a prompt the user
-    wrote — an inline-code sample, a fenced XML example — is their content and
-    survives, so the harvested request stays what they typed.
+    Both are positioned, not textual. A ``<pasted_content>`` wrapper is
+    unwrapped only while it *leads* the message, which is how the host
+    prepends it — and a ``<system-reminder>`` block only while it leads as
+    well. Neither rule reaches inside the text the user wrote: a request that
+    names the tag pair literally (an inline-code sample, a fenced XML
+    example, a fixture with attributes) keeps its tags, so the harvested
+    request and the mined intent stay what they typed. Stripping every
+    occurrence changed both.
     """
     if "<" not in text:
         return text
-    out = _PASTED_CONTENT_RE.sub("", text)
+    out = text
     while True:
         stripped = out.lstrip()
-        match = _SYSTEM_REMINDER_RE.match(stripped)
-        if match is None:
-            break
-        out = stripped[match.end():]
-    return out
+        pasted = _PASTED_CONTENT_LEAD_RE.match(stripped)
+        if pasted is not None:
+            out = pasted.group(1) + stripped[pasted.end():]
+            continue
+        reminder = _SYSTEM_REMINDER_RE.match(stripped)
+        if reminder is not None:
+            out = stripped[reminder.end():]
+            continue
+        return out
 
 
 def _is_meta_prompt(text: str) -> bool:
